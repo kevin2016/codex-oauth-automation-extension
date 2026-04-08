@@ -30,6 +30,7 @@ const DEFAULT_STATE = {
   localhostUrl: null,
   flowStartTime: null,
   tabRegistry: {},
+  sourceLastUrls: {},
   logs: [],
   vpsUrl: '',
   vpsPassword: '',
@@ -93,6 +94,7 @@ async function resetState() {
     'seenInbucketMailIds',
     'accounts',
     'tabRegistry',
+    'sourceLastUrls',
     'vpsUrl',
     'vpsPassword',
     'customPassword',
@@ -108,6 +110,7 @@ async function resetState() {
     seenInbucketMailIds: prev.seenInbucketMailIds || [],
     accounts: prev.accounts || [],
     tabRegistry: prev.tabRegistry || {},
+    sourceLastUrls: prev.sourceLastUrls || {},
     vpsUrl: prev.vpsUrl || '',
     vpsPassword: prev.vpsPassword || '',
     customPassword: prev.customPassword || '',
@@ -180,6 +183,81 @@ async function getTabId(source) {
   return registry[source]?.tabId || null;
 }
 
+function parseUrlSafely(rawUrl) {
+  if (!rawUrl) return null;
+  try {
+    return new URL(rawUrl);
+  } catch {
+    return null;
+  }
+}
+
+function isSignupPageHost(hostname = '') {
+  return ['auth0.openai.com', 'auth.openai.com', 'accounts.openai.com'].includes(hostname);
+}
+
+function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
+  const candidate = parseUrlSafely(candidateUrl);
+  if (!candidate) return false;
+
+  const reference = parseUrlSafely(referenceUrl);
+
+  switch (source) {
+    case 'signup-page':
+      return isSignupPageHost(candidate.hostname);
+    case 'duck-mail':
+      return candidate.hostname === 'duckduckgo.com' && candidate.pathname.startsWith('/email/');
+    case 'qq-mail':
+      return candidate.hostname === 'mail.qq.com' || candidate.hostname === 'wx.mail.qq.com';
+    case 'mail-163':
+      return candidate.hostname === 'mail.163.com';
+    case 'inbucket-mail':
+      return Boolean(reference)
+        && candidate.origin === reference.origin
+        && candidate.pathname.startsWith('/m/');
+    case 'vps-panel':
+      return Boolean(reference) && candidate.origin === reference.origin;
+    default:
+      return false;
+  }
+}
+
+async function rememberSourceLastUrl(source, url) {
+  if (!source || !url) return;
+  const state = await getState();
+  const sourceLastUrls = { ...(state.sourceLastUrls || {}) };
+  sourceLastUrls[source] = url;
+  await setState({ sourceLastUrls });
+}
+
+async function closeConflictingTabsForSource(source, currentUrl, options = {}) {
+  const { excludeTabIds = [] } = options;
+  const excluded = new Set(excludeTabIds.filter(id => Number.isInteger(id)));
+  const state = await getState();
+  const lastUrl = state.sourceLastUrls?.[source];
+  const referenceUrls = [currentUrl, lastUrl].filter(Boolean);
+
+  if (!referenceUrls.length) return;
+
+  const tabs = await chrome.tabs.query({});
+  const matchedIds = tabs
+    .filter((tab) => Number.isInteger(tab.id) && !excluded.has(tab.id))
+    .filter((tab) => referenceUrls.some((refUrl) => matchesSourceUrlFamily(source, tab.url, refUrl)))
+    .map(tab => tab.id);
+
+  if (!matchedIds.length) return;
+
+  await chrome.tabs.remove(matchedIds).catch(() => {});
+
+  const registry = await getTabRegistry();
+  if (registry[source]?.tabId && matchedIds.includes(registry[source].tabId)) {
+    registry[source] = null;
+    await setState({ tabRegistry: registry });
+  }
+
+  await addLog(`已关闭 ${matchedIds.length} 个旧的${getSourceLabel(source)}标签页。`, 'info');
+}
+
 // ============================================================
 // Command Queue (for content scripts not yet ready)
 // ============================================================
@@ -226,6 +304,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
   const alive = await isTabAlive(source);
   if (alive) {
     const tabId = await getTabId(source);
+    await closeConflictingTabsForSource(source, url, { excludeTabIds: [tabId] });
     const currentTab = await chrome.tabs.get(tabId);
     const sameUrl = currentTab.url === url;
     const shouldReloadOnReuse = sameUrl && options.reloadIfSameUrl;
@@ -273,6 +352,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
         await new Promise(r => setTimeout(r, 500));
       }
 
+      await rememberSourceLastUrl(source, url);
       return tabId;
     }
 
@@ -317,10 +397,12 @@ async function reuseOrCreateTab(source, url, options = {}) {
     // Wait a bit for content script to inject and send READY
     await new Promise(r => setTimeout(r, 500));
 
+    await rememberSourceLastUrl(source, url);
     return tabId;
   }
 
   // Create new tab
+  await closeConflictingTabsForSource(source, url);
   const tab = await chrome.tabs.create({ url, active: true });
   console.log(LOG_PREFIX, `Created new tab ${source} (${tab.id})`);
 
@@ -352,6 +434,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
     });
   }
 
+  await rememberSourceLastUrl(source, url);
   return tab.id;
 }
 
@@ -1810,9 +1893,11 @@ async function executeStep9(state) {
   const alive = tabId && await isTabAlive('vps-panel');
 
   if (!alive) {
+    await closeConflictingTabsForSource('vps-panel', state.vpsUrl);
     // Create new tab
     const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true });
     tabId = tab.id;
+    await rememberSourceLastUrl('vps-panel', state.vpsUrl);
     await new Promise(resolve => {
       const listener = (tid, info) => {
         if (tid === tabId && info.status === 'complete') {
@@ -1823,7 +1908,9 @@ async function executeStep9(state) {
       chrome.tabs.onUpdated.addListener(listener);
     });
   } else {
+    await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
     await chrome.tabs.update(tabId, { active: true });
+    await rememberSourceLastUrl('vps-panel', state.vpsUrl);
   }
 
   // Inject scripts directly and wait for them to be ready
